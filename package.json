@@ -1,0 +1,29 @@
+{
+  "name": "website-recovery-crawler",
+  "version": "1.0.0",
+  "description": "Production-grade website recovery crawler using Playwright",
+  "private": true,
+  "scripts": {
+    "crawl": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "cheerio": "^1.0.0",
+    "commander": "^12.1.0",
+    "dotenv": "^16.5.0",
+    "mime-types": "^2.1.35",
+    "p-queue": "^7.4.1",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0",
+    "playwright": "^1.49.1"
+  },
+  "devDependencies": {
+    "@types/archiver": "^6.0.3",
+    "@types/mime-types": "^2.1.4",
+    "@types/node": "^22",
+    "tsx": "^4.21.0",
+    "typescript": "~5.7.0"
+  }
+}

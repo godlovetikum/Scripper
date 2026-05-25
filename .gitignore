@@ -1,0 +1,10 @@
+node_modules/
+dist/
+output/
+crawl-output.zip
+*.zip
+.env
+.crawl-state.json
+screenshots/
+*.log
+*.tsbuildinfo

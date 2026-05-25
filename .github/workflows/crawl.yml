@@ -1,0 +1,405 @@
+name: Website Recovery Crawler
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      url:
+        description: "Target URL to crawl [REQUIRED]"
+        required: true
+        type: string
+
+      depth:
+        description: "Max crawl depth from root URL (default: 10)"
+        required: false
+        default: "10"
+        type: string
+
+      concurrency:
+        description: "Concurrent page workers (default: 3)"
+        required: false
+        default: "3"
+        type: string
+
+      delay_ms:
+        description: "Delay between page requests in ms (default: 500)"
+        required: false
+        default: "500"
+        type: string
+
+      max_pages:
+        description: "Max pages to crawl, 0 = unlimited (default: 0)"
+        required: false
+        default: "0"
+        type: string
+
+      max_retries:
+        description: "Max retries for failed requests (default: 3)"
+        required: false
+        default: "3"
+        type: string
+
+      scroll:
+        description: "Scroll pages to trigger lazy-loaded content (default: true)"
+        required: false
+        default: "true"
+        type: string
+
+      allowed_domains:
+        description: "Extra domains to include, comma-separated (e.g. cdn.example.com)"
+        required: false
+        default: ""
+        type: string
+
+      network_idle_ms:
+        description: "Network idle wait after navigation in ms (default: 5000)"
+        required: false
+        default: "5000"
+        type: string
+
+      page_timeout_ms:
+        description: "Hard page load timeout in ms (default: 30000)"
+        required: false
+        default: "30000"
+        type: string
+
+      viewport_width:
+        description: "Browser viewport width in px (default: 1280)"
+        required: false
+        default: "1280"
+        type: string
+
+      viewport_height:
+        description: "Browser viewport height in px (default: 900)"
+        required: false
+        default: "900"
+        type: string
+
+      user_agent:
+        description: "Custom User-Agent string (blank = Playwright default)"
+        required: false
+        default: ""
+        type: string
+
+      debug_screenshots:
+        description: "Save PNG screenshot on page errors (default: true)"
+        required: false
+        default: "true"
+        type: string
+
+      log_level:
+        description: "Log verbosity: trace | debug | info | warn | error (default: info)"
+        required: false
+        default: "info"
+        type: string
+
+      resume:
+        description: "Resume from a previous interrupted run (default: false)"
+        required: false
+        default: "false"
+        type: string
+
+      strip_params:
+        description: |
+          Extra query-param names to strip from URLs before normalization,
+          comma-separated (extends built-in list: utm_*, fbclid, add-to-cart, etc.)
+        required: false
+        default: ""
+        type: string
+
+      block_params:
+        description: |
+          Extra query-param names that mark a URL as an action endpoint to skip
+          entirely, comma-separated (extends built-in heuristics: nonce/csrf
+          keywords and 32+ char hex values are already detected automatically)
+        required: false
+        default: ""
+        type: string
+
+      create_release:
+        description: "Create a GitHub Release with the output ZIP (default: true)"
+        required: false
+        default: "true"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: crawl-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    name: "Crawl ${{ github.event.inputs.url }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10"
+
+      - name: Get pnpm store path
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      - name: Install Node dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Get Playwright version
+        id: pw-version
+        run: |
+          echo "version=$(node -e "console.log(require('./node_modules/playwright/package.json').version)")" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install chromium --with-deps
+
+      - name: Derive output cache key from URL
+        id: url-key
+        shell: bash
+        run: |
+          SAFE=$(echo "${{ github.event.inputs.url }}" \
+            | sed 's|https\?://||g' \
+            | tr -cs 'a-zA-Z0-9_-' '_' \
+            | cut -c1-80)
+          echo "key=crawl-output-${SAFE}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore output cache (resume runs only)
+        if: github.event.inputs.resume == 'true'
+        uses: actions/cache@v4
+        with:
+          path: output
+          key: ${{ steps.url-key.outputs.key }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ steps.url-key.outputs.key }}-
+
+      - name: Run crawler
+        id: crawl
+        env:
+          LOG_PRETTY: "false"
+          LOG_LEVEL: ${{ github.event.inputs.log_level || 'info' }}
+        shell: bash
+        run: |
+          set +e
+
+          ARGS=(
+            --url             "${{ github.event.inputs.url }}"
+            --depth           "${{ github.event.inputs.depth || '10' }}"
+            --concurrency     "${{ github.event.inputs.concurrency || '3' }}"
+            --delay           "${{ github.event.inputs.delay_ms || '500' }}"
+            --network-idle-ms "${{ github.event.inputs.network_idle_ms || '5000' }}"
+            --page-timeout    "${{ github.event.inputs.page_timeout_ms || '30000' }}"
+            --max-retries     "${{ github.event.inputs.max_retries || '3' }}"
+            --max-pages       "${{ github.event.inputs.max_pages || '0' }}"
+            --viewport-width  "${{ github.event.inputs.viewport_width || '1280' }}"
+            --viewport-height "${{ github.event.inputs.viewport_height || '900' }}"
+            --output          "./output"
+            --log-level       "${{ github.event.inputs.log_level || 'info' }}"
+            --no-pretty
+          )
+
+          [ "${{ github.event.inputs.scroll }}"            = "false" ] && ARGS+=(--no-scroll)
+          [ "${{ github.event.inputs.debug_screenshots }}" = "false" ] && ARGS+=(--no-screenshots)
+          [ "${{ github.event.inputs.resume }}"            = "true"  ] && ARGS+=(--resume)
+
+          UA="${{ github.event.inputs.user_agent }}"
+          [ -n "$UA" ] && ARGS+=(--user-agent "$UA")
+
+          DOMAINS="${{ github.event.inputs.allowed_domains }}"
+          [ -n "$DOMAINS" ] && ARGS+=(--allowed-domains "$DOMAINS")
+
+          STRIP="${{ github.event.inputs.strip_params }}"
+          [ -n "$STRIP" ] && ARGS+=(--strip-params "$STRIP")
+
+          BLOCK="${{ github.event.inputs.block_params }}"
+          [ -n "$BLOCK" ] && ARGS+=(--block-params "$BLOCK")
+
+          pnpm crawl "${ARGS[@]}"
+          EXIT_CODE=$?
+
+          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+          exit $EXIT_CODE
+
+        continue-on-error: true
+
+      - name: Save output cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: output
+          key: ${{ steps.url-key.outputs.key }}-${{ github.run_id }}
+
+      - name: Upload crawl reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-reports-${{ github.run_id }}
+          path: |
+            output/crawl-report.json
+            output/crawl-stats.json
+            output/missing-assets.json
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload error screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-screenshots-${{ github.run_id }}
+          path: output/screenshots/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload output ZIP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-output-${{ github.run_id }}
+          path: crawl-output.zip
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          STATS="output/crawl-stats.json"
+          echo "## Website Recovery Crawl" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Setting | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| URL | \`${{ github.event.inputs.url }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Depth | ${{ github.event.inputs.depth || '10' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Concurrency | ${{ github.event.inputs.concurrency || '3' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Max pages | ${{ github.event.inputs.max_pages || 'unlimited' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Delay | ${{ github.event.inputs.delay_ms || '500' }} ms |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Resumed | ${{ github.event.inputs.resume || 'false' }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$STATS" ]; then
+            PP=$(node -e "const s=require('./${STATS}');console.log(s.pagesProcessed??'N/A')")
+            PS=$(node -e "const s=require('./${STATS}');console.log(s.pagesSucceeded??'N/A')")
+            PF=$(node -e "const s=require('./${STATS}');console.log(s.pagesFailed??'N/A')")
+            AD=$(node -e "const s=require('./${STATS}');console.log(s.assetsDownloaded??'N/A')")
+            DS=$(node -e "const s=require('./${STATS}');const v=s.durationSeconds;console.log(v!=null?v.toFixed(1)+'s':'N/A')")
+            echo "### Results" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Pages processed | ${PP} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Pages succeeded | ${PS} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Pages failed | ${PF} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Assets downloaded | ${AD} |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| Duration | ${DS} |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "> Stats file not found — crawl may have failed before producing output." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Get timestamp
+        if: github.event.inputs.create_release == 'true'
+        id: ts
+        run: echo "value=$(date +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+
+      - name: Derive domain for release name
+        if: github.event.inputs.create_release == 'true'
+        id: release-name
+        shell: bash
+        run: |
+          DOMAIN=$(echo "${{ github.event.inputs.url }}" \
+            | sed 's|https\?://||g' \
+            | cut -d'/' -f1)
+          echo "domain=${DOMAIN}" >> "$GITHUB_OUTPUT"
+
+      - name: Read stats for release notes
+        if: github.event.inputs.create_release == 'true'
+        id: release-stats
+        shell: bash
+        run: |
+          STATS="output/crawl-stats.json"
+          if [ -f "$STATS" ]; then
+            PP=$(node -e "const s=require('./${STATS}');console.log(s.pagesProcessed??0)")
+            AD=$(node -e "const s=require('./${STATS}');console.log(s.assetsDownloaded??0)")
+            DS=$(node -e "const s=require('./${STATS}');const v=s.durationSeconds;console.log(v!=null?v.toFixed(1)+'s':'unknown')")
+            echo "pages=${PP}"    >> "$GITHUB_OUTPUT"
+            echo "assets=${AD}"   >> "$GITHUB_OUTPUT"
+            echo "duration=${DS}" >> "$GITHUB_OUTPUT"
+          else
+            echo "pages=0"    >> "$GITHUB_OUTPUT"
+            echo "assets=0"   >> "$GITHUB_OUTPUT"
+            echo "duration=?" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        if: github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "crawl-${{ steps.release-name.outputs.domain }}-${{ steps.ts.outputs.value }}"
+          name: "Recovery — ${{ steps.release-name.outputs.domain }} — ${{ steps.ts.outputs.value }}"
+          body: |
+            ## Website Recovery Crawl
+
+            | Field | Value |
+            |-------|-------|
+            | **Target** | `${{ github.event.inputs.url }}` |
+            | **Pages crawled** | ${{ steps.release-stats.outputs.pages }} |
+            | **Assets downloaded** | ${{ steps.release-stats.outputs.assets }} |
+            | **Duration** | ${{ steps.release-stats.outputs.duration }} |
+            | **Depth** | ${{ github.event.inputs.depth || '10' }} |
+            | **Concurrency** | ${{ github.event.inputs.concurrency || '3' }} |
+            | **Max pages** | ${{ github.event.inputs.max_pages || 'unlimited' }} |
+            | **Resumed** | ${{ github.event.inputs.resume || 'false' }} |
+            | **Run** | [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+            ### Deploying the output
+            1. Download `crawl-output.zip` from this release
+            2. Extract the ZIP
+            3. Serve with any static host:
+               ```bash
+               npx serve .
+               npx netlify-cli deploy --dir .
+               ```
+          files: crawl-output.zip
+          fail_on_unmatched_files: false
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check crawl exit code
+        if: always()
+        shell: bash
+        run: |
+          CODE="${{ steps.crawl.outputs.exit_code }}"
+          if [ "$CODE" = "2" ]; then
+            echo "::error::Crawler exited with a fatal error (exit code 2)."
+            exit 2
+          elif [ "$CODE" = "1" ]; then
+            echo "::warning::Crawler finished with some failures (exit code 1). Some pages or assets were not recovered."
+          else
+            echo "Crawl completed successfully."
+          fi
